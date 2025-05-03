@@ -1,50 +1,54 @@
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebSrv.h>
-#include <math.h>
+#include <WiFi.h>               // Wi-Fi control
+#include <AsyncTCP.h>           // Asynchronous TCP (required for web server)
+#include <ESPAsyncWebSrv.h>     // Asynchronous web server
+#include <math.h>               // Math functions
 
-// Wi-Fi credentials
-const char* ssid = "iPhone";
-const char* password = "mattmia7";
+// ==== Wi-Fi CREDENTIALS ====
+const char* ssid = "iPhone";            // Your hotspot or router SSID
+const char* password = "mattmia7";      // Your Wi-Fi password
 
-// Sensor pins
-const int xPin = 34;
-const int yPin = 35;
-const int zPin = 32;
-const int emgPin = 36;
-const int contactMicPin = 33;
-const int thermistorPin = 39;
+// ==== SENSOR PINS ====
+const int xPin = 34;                    // Accelerometer X-axis (analog)
+const int yPin = 35;                    // Accelerometer Y-axis (analog)
+const int zPin = 32;                    // Accelerometer Z-axis (analog)
+const int emgPin = 36;                  // EMG sensor (analog)
+const int contactMicPin = 33;           // Contact microphone (analog)
+const int thermistorPin = 39;           // Thermistor input (analog)
 
-// Thresholds
-const int contactThreshold = 2000;
-const float seriesResistor = 10000.0;
-const float wearThreshold = 8500.0;
+// ==== THRESHOLD CONSTANTS ====
+const int contactThreshold = 2000;      // Raw contact mic threshold
+const float seriesResistor = 10000.0;   // Series resistor in voltage divider with thermistor
+const float wearThreshold = 8500.0;     // Resistance threshold to determine "worn"
 
-// Globals
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+// ==== GLOBAL VARIABLES ====
+AsyncWebServer server(80);              // HTTP server on port 80
+AsyncWebSocket ws("/ws");              // WebSocket endpoint at /ws
 
-unsigned long lastSampleTime = 0;
-int emgValue = 0;
+unsigned long lastSampleTime = 0;       // Timestamp of last sensor read
+int emgValue = 0;                       
 int contactMicValue = 0;
-bool isWorn = false;
-int eventCounter = 0;
-bool wasAboveThreshold = false;
+bool isWorn = false;                    // Whether device is currently being worn
+int eventCounter = 0;                   // Event count (e.g., bruxism/TMJ clicks)
+bool wasAboveThreshold = false;         // Used to detect rising edge for threshold crossings
 
-// Get orientation from accelerometer
+// ==== ORIENTATION FUNCTION ====
 String getOrientation() {
+    // Read raw ADC values from accelerometer
     int rawX = analogRead(xPin);
     int rawY = analogRead(yPin);
     int rawZ = analogRead(zPin);
 
+    // Convert to voltage (assuming 3.3V reference and 12-bit ADC)
     float voltageX = (rawX / 4095.0) * 3.3;
     float voltageY = (rawY / 4095.0) * 3.3;
     float voltageZ = (rawZ / 4095.0) * 3.3;
 
+    // Convert voltage to acceleration (centered at 1.5V, sensitivity ~60mV/g)
     float accelX = (voltageX - 1.5) / 0.06;
     float accelY = (voltageY - 1.5) / 0.06;
     float accelZ = (voltageZ - 1.5) / 0.06;
 
+    // Determine body orientation based on Y/Z axes
     if (accelY > 0.0) return "Laying Down on Left Side";
     if (accelY < -1.2) return "Laying Down on Right Side";
     if (accelZ > 0.2) return "Laying Down on Back";
@@ -52,29 +56,30 @@ String getOrientation() {
     return "Unknown Position";
 }
 
-// Check if device is worn via thermistor
+// ==== WEAR STATUS DETECTION ====
 bool checkWearStatus() {
     int adcValue = analogRead(thermistorPin);
     float voltage = adcValue * (3.3 / 4095.0);
     float resistance = (seriesResistor * (3.3 - voltage)) / voltage;
-    return resistance < wearThreshold;
+    return resistance < wearThreshold;  // True = being worn
 }
 
-// Sensor Sampling Task
+// ==== SENSOR SAMPLING TASK ====
 void sampleSensors(void *parameter) {
-    char message[128];
+    char message[128];  // Buffer to hold JSON message
 
     while (true) {
         unsigned long currentTime = micros();
-        if (currentTime - lastSampleTime >= 100000) { // 100 ms = 10Hz
+        if (currentTime - lastSampleTime >= 100000) {  // Sample every 100ms (10Hz)
             lastSampleTime += 100000;
 
+            // Read sensors
             emgValue = analogRead(emgPin);
             contactMicValue = analogRead(contactMicPin);
             isWorn = checkWearStatus();
             String orientation = getOrientation();
 
-            // Threshold logic (contact mic only)
+            // Event detection (rising edge of threshold crossing)
             if (contactMicValue > contactThreshold && !wasAboveThreshold) {
                 eventCounter++;
                 wasAboveThreshold = true;
@@ -83,21 +88,26 @@ void sampleSensors(void *parameter) {
                 wasAboveThreshold = false;
             }
 
+            // Format sensor data into JSON
             snprintf(message, sizeof(message),
                 "{ \"emg\": %d, \"contactMic\": %d, \"orientation\": \"%s\", \"isWorn\": %s, \"counter\": %d }",
                 emgValue, contactMicValue, orientation.c_str(), isWorn ? "true" : "false", eventCounter);
 
+            // Broadcast data over WebSocket to all connected clients
             if (ws.count() > 0) {
                 ws.textAll(message);
             }
 
-            vTaskDelay(1);
+            vTaskDelay(1);  // Brief delay to yield to other tasks
         }
     }
 }
 
+// ==== SETUP FUNCTION ====
 void setup() {
     Serial.begin(115200);
+
+    // Connect to Wi-Fi
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
@@ -106,7 +116,7 @@ void setup() {
     Serial.println("\n✅ Connected to WiFi!");
     Serial.println("ESP32 IP Address: " + WiFi.localIP().toString());
 
-    // WebSocket
+    // WebSocket event handling
     ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
                   void *arg, uint8_t *data, size_t len) {
         if (type == WS_EVT_DISCONNECT) {
@@ -116,7 +126,7 @@ void setup() {
     });
     server.addHandler(&ws);
 
-    // HTML UI
+    // Serve HTML UI page
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         String html = "<html><head><style>";
         html += "body { font-family: Arial; text-align: center; }";
@@ -143,13 +153,13 @@ void setup() {
         request->send(200, "text/html", html);
     });
 
-    // Endpoint for MATLAB
+    // Endpoint to fetch contact mic value (for MATLAB)
     server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
         int micVal = analogRead(contactMicPin);
         request->send(200, "text/plain", String(micVal));
     });
 
-    // Endpoint for external counter update (e.g., from MATLAB)
+    // Endpoint to update event counter from an external app (like MATLAB)
     server.on("/updateCounter", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (request->hasParam("counter", true)) {
             String counterValue = request->getParam("counter", true)->value();
@@ -161,20 +171,21 @@ void setup() {
         }
     });
 
-    server.begin();
+    server.begin();  // Start the server
 
-    // Start sensor sampling task
+    // Launch sensor sampling loop on core 1
     xTaskCreatePinnedToCore(
-        sampleSensors,
-        "SampleSensors",
-        10000,
-        NULL,
-        1,
-        NULL,
-        1
+        sampleSensors,       // Task function
+        "SampleSensors",     // Task name
+        10000,               // Stack size (bytes)
+        NULL,                // Parameters
+        1,                   // Priority
+        NULL,                // Task handle
+        1                    // Core ID
     );
 }
 
+// ==== MAIN LOOP ====
 void loop() {
-    ws.cleanupClients();
+    ws.cleanupClients();  // Clean up disconnected WebSocket clients
 }
